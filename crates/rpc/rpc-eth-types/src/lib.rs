@@ -21,6 +21,9 @@ pub mod simulate;
 pub mod transaction;
 pub mod utils;
 
+#[allow(missing_docs)]
+pub mod debank;
+
 pub use builder::config::{EthConfig, EthFilterConfig};
 pub use cache::{
     config::EthStateCacheConfig, db::StateCacheDb, multi_consumer::MultiConsumerLruCache,
@@ -34,3 +37,10 @@ pub use gas_oracle::{
 pub use id_provider::EthSubscriptionIdProvider;
 pub use pending_block::{PendingBlock, PendingBlockEnv, PendingBlockEnvOrigin};
 pub use transaction::TransactionSource;
+
+
+pub use debank::{
+    build_debank_traces, get_storage_contracts_from_cache, get_storage_contracts_from_genesis,
+    get_storage_diffs_from_cache, BlockFile, BlockStorageDiff, DebankBlock, DebankEvent,
+    DebankOutPut, DebankTrace, DebankTransaction,
+};

@@ -102,6 +102,7 @@ use crate::middleware::RethRpcMiddleware;
 pub use metrics::{MeteredRequestFuture, RpcRequestMetricsService};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_rpc::eth::sim_bundle::EthSimBundle;
+use reth_rpc_eth_api::helpers::{EthBlocks, LoadReceipt};
 
 // Rpc rate limiter
 pub mod rate_limiter;
@@ -718,7 +719,7 @@ where
     /// If called outside of the tokio runtime. See also [`Self::eth_api`]
     pub fn register_trace(&mut self) -> &mut Self
     where
-        EthApi: TraceExt,
+        EthApi: TraceExt + EthBlocks + LoadReceipt,
     {
         let trace_api = self.trace_api();
         self.modules.insert(RethRpcModule::Trace, trace_api.into_rpc().into());
