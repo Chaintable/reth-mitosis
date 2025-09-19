@@ -1,29 +1,32 @@
 use alloy_consensus::{constants::KECCAK_EMPTY, BlockHeader};
 use alloy_genesis::Genesis;
 use alloy_network::ReceiptResponse;
-use alloy_primitives::{hex, keccak256, Address, BlockHash, BlockNumber, Bytes, B256 as H256, B256, U256};
+use alloy_primitives::{
+    hex, keccak256, map::HashMap, Address, BlockHash, BlockNumber, Bytes, B256 as H256, B256, U256,
+};
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_rpc_types_eth::Header;
 use reth_primitives_traits::{Block, RecoveredBlock, Transaction};
-use reth_revm::db::{AccountState, Cache};
-use revm::{interpreter::InstructionResult, DatabaseRef};
-use revm_bytecode::opcode::OpCode;
-use revm_inspectors::{
-    tracing::{
-        types::{CallKind, CallLog, CallTraceNode, TraceMemberOrder},
-        CallTraceArena,
+use reth_revm::{
+    context::ContextTr,
+    db::{AccountState, Cache},
+    inspector::JournalExt,
+    interpreter::{
+        interpreter_types::{InputsTr, Jumps},
+        Interpreter,
     },
+    Inspector,
+};
+use reth_trie::EMPTY_ROOT_HASH;
+use revm::{interpreter::InstructionResult, DatabaseRef};
+use revm_bytecode::{opcode, opcode::OpCode};
+use revm_inspectors::tracing::{
+    types::{CallKind, CallLog, CallTraceNode, TraceMemberOrder},
+    CallTraceArena,
 };
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::str::FromStr;
-use alloy_primitives::map::HashMap;
-use revm_bytecode::opcode;
-use reth_revm::context::ContextTr;
-use reth_revm::Inspector;
-use reth_revm::inspector::JournalExt;
-use reth_revm::interpreter::Interpreter;
-use reth_revm::interpreter::interpreter_types::{InputsTr, Jumps};
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
 pub struct BlockStorageDiff {
@@ -157,7 +160,7 @@ impl From<&Genesis> for BlockStorageDiff {
 
         BlockStorageDiff {
             hash: H256::ZERO, // These will need to be set by the caller
-            parent_hash: KECCAK_EMPTY,
+            parent_hash: EMPTY_ROOT_HASH,
             new_accounts,
             deleted_accounts: vec![],
             storage_diffs,

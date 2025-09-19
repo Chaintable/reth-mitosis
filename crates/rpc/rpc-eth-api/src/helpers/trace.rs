@@ -521,8 +521,7 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> {
                     .collect::<Result<_, _>>()?;
                 let change_addresses = get_storage_contracts_from_cache(&db.diff.cache);
                 Ok((results, get_storage_diffs_from_cache(db.diff.cache, pre_db), change_addresses))
-            })
-                .await
+            }).await
         }
     }
 }
