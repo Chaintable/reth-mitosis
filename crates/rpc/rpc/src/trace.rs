@@ -1,8 +1,14 @@
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::BlockId;
 use alloy_evm::block::calc::{base_block_reward_pre_merge, block_reward, ommer_reward};
-use alloy_primitives::{map::HashSet, Bytes, B256, U256};
-use alloy_rpc_types_eth::{state::{EvmOverrides, StateOverride}, BlockOverrides, Header, Index};
+use alloy_primitives::{
+    map::{HashMap, HashSet},
+    Address, BlockHash, Bytes, B256, U256,
+};
+use alloy_rpc_types_eth::{
+    state::{EvmOverrides, StateOverride},
+    BlockOverrides, Header, Index,
+};
 use alloy_rpc_types_trace::{
     filter::TraceFilter,
     opcode::{BlockOpcodeGas, TransactionOpcodeGas},
@@ -18,21 +24,31 @@ use reth_revm::{database::StateProviderDatabase, db::CacheDB};
 use reth_rpc_api::TraceApiServer;
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
-    helpers::{Call, LoadPendingBlock, LoadTransaction, Trace, TraceExt},
+    helpers::{
+        block::EthBlocks, Call, LoadPendingBlock, LoadReceipt, LoadTransaction, Trace, TraceExt,
+    },
     FromEthApiError, RpcNodeCore,
 };
-use reth_rpc_eth_types::{build_debank_traces, error::EthApiError, get_storage_contracts_from_genesis, utils::recover_raw_transaction, BlockFile, BlockStorageDiff, DebankBlock, DebankOutPut, DebankTransaction, EthConfig};
+use reth_rpc_eth_types::{
+    build_debank_traces, error::EthApiError, get_storage_contracts_from_genesis,
+    utils::recover_raw_transaction, BlockFile, BlockStorageDiff, DebankBlock, DebankOutPut,
+    DebankTransaction, EthConfig,
+};
 use reth_storage_api::{BlockNumReader, BlockReader};
 use reth_tasks::pool::BlockingTaskGuard;
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
+use revm::bytecode::OpCode;
 use revm::DatabaseCommit;
 use revm_inspectors::{
     opcode::OpcodeGasInspector,
-    tracing::{parity::populate_state_diff, TracingInspector, TracingInspectorConfig},
+    tracing::{
+        parity::populate_state_diff, OpcodeFilter, TracingInspector, TracingInspectorConfig,
+    },
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
-use reth_rpc_eth_api::helpers::{EthBlocks, LoadReceipt};
+use reth_rpc_eth_types::debank::StorageInspectorWrapper;
 
 /// `trace` API implementation.
 ///
@@ -565,6 +581,41 @@ where
             transactions,
         }))
     }
+
+    /// Returns all storage slots accessed during transaction execution along with their access
+    /// counts.
+    pub async fn trace_block_storage_access(
+        &self,
+        block_id: BlockId,
+    ) -> Result<Option<BlockStorageAccess>, Eth::Error> {
+        let res = self
+            .eth_api()
+            .trace_block_inspector(
+                block_id,
+                None,
+                StorageInspectorWrapper::default,
+                move |tx_info, ctx| {
+                    let trace = TransactionStorageAccess {
+                        transaction_hash: tx_info.hash.expect("tx hash is set"),
+                        storage_access: ctx.inspector.accessed_slots().clone(),
+                        unique_loads: ctx.inspector.unique_loads(),
+                        warm_loads: ctx.inspector.warm_loads(),
+                    };
+                    Ok(trace)
+                },
+            )
+            .await?;
+
+        let Some(transactions) = res else { return Ok(None) };
+
+        let Some(block) = self.eth_api().recovered_block(block_id).await? else { return Ok(None) };
+
+        Ok(Some(BlockStorageAccess {
+            block_hash: block.hash(),
+            block_number: block.number(),
+            transactions,
+        }))
+    }
 }
 
 impl<Eth> TraceApi<Eth>
@@ -659,19 +710,25 @@ where
                 validation_hash,
             });
         }
+        let log_index = std::cell::RefCell::new(0);
         let (mut traces, mut state_diff, change_addresses) = self
             .eth_api()
             .trace_all_block(
                 block_id,
                 || {
-                    TracingInspector::new(
-                        TracingInspectorConfig::default_parity().set_record_logs(true),
-                    )
+                    let mut trace_cfg = TracingInspectorConfig::default_parity()
+                        .set_steps(true)
+                        .set_record_logs(true)
+                        .set_exclude_precompile_calls(false);
+                    trace_cfg.record_opcodes_filter =
+                        Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
+                    TracingInspector::new(trace_cfg)
                 },
                 move |tx_info, mut ctx| {
                     Ok(build_debank_traces(
                         tx_info.hash.unwrap(),
                         ctx.take_inspector().into_traces(),
+                        &log_index,
                     ))
                 },
             )
@@ -842,6 +899,33 @@ struct TraceApiInner<Eth> {
     blocking_task_guard: BlockingTaskGuard,
     // eth config settings
     eth_config: EthConfig,
+}
+
+/// Response type for storage tracing that contains all accessed storage slots
+/// for a transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionStorageAccess {
+    /// Hash of the transaction
+    pub transaction_hash: B256,
+    /// Tracks storage slots and access counter.
+    pub storage_access: HashMap<Address, HashMap<B256, u64>>,
+    /// Number of unique storage loads
+    pub unique_loads: u64,
+    /// Number of warm storage loads
+    pub warm_loads: u64,
+}
+
+/// Response type for storage tracing that contains all accessed storage slots
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockStorageAccess {
+    /// The block hash
+    pub block_hash: BlockHash,
+    /// The block's number
+    pub block_number: u64,
+    /// All executed transactions in the block in the order they were executed
+    pub transactions: Vec<TransactionStorageAccess>,
 }
 
 /// Helper to construct a [`LocalizedTransactionTrace`] that describes a reward to the block
