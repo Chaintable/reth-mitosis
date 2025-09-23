@@ -1,10 +1,13 @@
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::BlockId;
 use alloy_evm::block::calc::{base_block_reward_pre_merge, block_reward, ommer_reward};
-use alloy_primitives::{map::HashSet, Bytes, B256, U256};
+use alloy_primitives::{
+    map::{HashMap, HashSet},
+    Address, BlockHash, Bytes, B256, U256,
+};
 use alloy_rpc_types_eth::{
     state::{EvmOverrides, StateOverride},
-    BlockOverrides, Index,
+    BlockOverrides, Header, Index,
 };
 use alloy_rpc_types_trace::{
     filter::TraceFilter,
@@ -21,20 +24,31 @@ use reth_revm::{database::StateProviderDatabase, db::CacheDB};
 use reth_rpc_api::TraceApiServer;
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
-    helpers::{Call, LoadPendingBlock, LoadTransaction, Trace, TraceExt},
+    helpers::{
+        block::EthBlocks, Call, LoadPendingBlock, LoadReceipt, LoadTransaction, Trace, TraceExt,
+    },
     FromEthApiError, RpcNodeCore,
 };
-use reth_rpc_eth_types::{error::EthApiError, utils::recover_raw_transaction, EthConfig};
+use reth_rpc_eth_types::{
+    build_debank_traces, error::EthApiError, get_storage_contracts_from_genesis,
+    utils::recover_raw_transaction, BlockFile, BlockStorageDiff, DebankBlock, DebankOutPut,
+    DebankTransaction, EthConfig,
+};
 use reth_storage_api::{BlockNumReader, BlockReader};
 use reth_tasks::pool::BlockingTaskGuard;
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
+use revm::bytecode::OpCode;
 use revm::DatabaseCommit;
 use revm_inspectors::{
     opcode::OpcodeGasInspector,
-    tracing::{parity::populate_state_diff, TracingInspector, TracingInspectorConfig},
+    tracing::{
+        parity::populate_state_diff, OpcodeFilter, TracingInspector, TracingInspectorConfig,
+    },
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
+use reth_rpc_eth_types::debank::StorageInspectorWrapper;
 
 /// `trace` API implementation.
 ///
@@ -567,12 +581,181 @@ where
             transactions,
         }))
     }
+
+    /// Returns all storage slots accessed during transaction execution along with their access
+    /// counts.
+    pub async fn trace_block_storage_access(
+        &self,
+        block_id: BlockId,
+    ) -> Result<Option<BlockStorageAccess>, Eth::Error> {
+        let res = self
+            .eth_api()
+            .trace_block_inspector(
+                block_id,
+                None,
+                StorageInspectorWrapper::default,
+                move |tx_info, ctx| {
+                    let trace = TransactionStorageAccess {
+                        transaction_hash: tx_info.hash.expect("tx hash is set"),
+                        storage_access: ctx.inspector.accessed_slots().clone(),
+                        unique_loads: ctx.inspector.unique_loads(),
+                        warm_loads: ctx.inspector.warm_loads(),
+                    };
+                    Ok(trace)
+                },
+            )
+            .await?;
+
+        let Some(transactions) = res else { return Ok(None) };
+
+        let Some(block) = self.eth_api().recovered_block(block_id).await? else { return Ok(None) };
+
+        Ok(Some(BlockStorageAccess {
+            block_hash: block.hash(),
+            block_number: block.number(),
+            transactions,
+        }))
+    }
+}
+
+impl<Eth> TraceApi<Eth>
+where
+    // tracing methods read from mempool, hence `LoadBlock` trait bound via
+    // `TraceExt`
+    Eth: TraceExt + 'static + EthBlocks + LoadReceipt,
+{
+    /// Trace block traces and state diff.
+    pub async fn trace_debank_block(&self, block_id: BlockId) -> Result<DebankOutPut, Eth::Error> {
+        let block = self.eth_api().recovered_block(block_id).await?;
+        let Some(block) = block else { return Err(EthApiError::HeaderNotFound(block_id).into()) };
+        let debank_block: DebankBlock = block.as_ref().into();
+        let debank_header = Header {
+            inner: alloy_consensus::Header {
+                parent_hash: block.header().parent_hash(),
+                ommers_hash: block.header().ommers_hash(),
+                beneficiary: block.header().beneficiary(),
+                state_root: block.header().state_root(),
+                transactions_root: block.header().transactions_root(),
+                receipts_root: block.header().receipts_root(),
+                logs_bloom: block.header().logs_bloom(),
+                difficulty: block.header().difficulty(),
+                number: block.header().number(),
+                gas_limit: block.header().gas_limit(),
+                gas_used: block.header().gas_used(),
+                timestamp: block.header().timestamp(),
+                extra_data: block.header().extra_data().clone(),
+                mix_hash: block.header().mix_hash().unwrap_or_default(),
+                nonce: block.header().nonce().unwrap_or_default(),
+                base_fee_per_gas: block.header().base_fee_per_gas(),
+                withdrawals_root: block.header().withdrawals_root(),
+                blob_gas_used: block.header().blob_gas_used(),
+                excess_blob_gas: block.header().excess_blob_gas(),
+                parent_beacon_block_root: block.header().parent_beacon_block_root(),
+                requests_hash: block.header().requests_hash(),
+            },
+            hash: block.hash(),
+            total_difficulty: None,
+            size: None,
+        };
+        if block.number() == 0 {
+            let mut state_diff: BlockStorageDiff = self.provider().chain_spec().genesis().into();
+            let genesis_hash = self.provider().chain_spec().genesis_hash();
+            state_diff.hash = genesis_hash;
+            let block_file = BlockFile {
+                block: debank_block,
+                storage_contracts: get_storage_contracts_from_genesis(
+                    self.provider().chain_spec().genesis(),
+                ),
+                ..Default::default()
+            };
+            let validation_hash = block_file.validation().validation_hash;
+            return Ok(DebankOutPut {
+                block_file,
+                header: debank_header,
+                state_diff: alloy_rlp::encode(state_diff).into(),
+                validation_hash,
+            });
+        }
+
+        let receipts = self.eth_api().block_receipts(block_id).await?;
+        let mut debank_txs: Vec<DebankTransaction> =
+            Vec::with_capacity(block.body().transactions().len());
+        let Some(receipts) = receipts else {
+            return Err(EthApiError::HeaderNotFound(block_id).into());
+        };
+        for index in 0..block.body().transactions().len() {
+            let tx = &block.body().transactions()[index];
+            let receipt = &receipts[index];
+            let debank_tx: DebankTransaction = (receipt, tx).into();
+            debank_txs.push(debank_tx);
+        }
+
+        let parent_block = self.eth_api().recovered_block(block.parent_hash().into()).await?;
+        let Some(parent_block) = parent_block else {
+            return Err(EthApiError::HeaderNotFound(block_id).into());
+        };
+        let mut block_file =
+            BlockFile { block: debank_block, transactions: debank_txs, ..Default::default() };
+        if parent_block.state_root() == block.state_root() {
+            let state_diff = BlockStorageDiff {
+                hash: block.state_root(),
+                parent_hash: parent_block.state_root(),
+                ..Default::default()
+            };
+            let validation_hash = block_file.validation().validation_hash;
+            return Ok(DebankOutPut {
+                block_file,
+                header: debank_header,
+                state_diff: alloy_rlp::encode(state_diff).into(),
+                validation_hash,
+            });
+        }
+        let log_index = std::cell::RefCell::new(0);
+        let (mut traces, mut state_diff, change_addresses) = self
+            .eth_api()
+            .trace_all_block(
+                block_id,
+                || {
+                    let mut trace_cfg = TracingInspectorConfig::default_parity()
+                        .set_steps(true)
+                        .set_record_logs(true)
+                        .set_exclude_precompile_calls(false);
+                    trace_cfg.record_opcodes_filter =
+                        Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
+                    TracingInspector::new(trace_cfg)
+                },
+                move |tx_info, mut ctx| {
+                    Ok(build_debank_traces(
+                        tx_info.hash.unwrap(),
+                        ctx.take_inspector().into_traces(),
+                        &log_index,
+                    ))
+                },
+            )
+            .await?;
+        for (trace, error_trace, event, error_event) in traces.drain(..) {
+            block_file.traces.extend(trace);
+            block_file.error_traces.extend(error_trace);
+            block_file.events.extend(event);
+            block_file.error_events.extend(error_event);
+        }
+        block_file.storage_contracts = change_addresses;
+        let validation_hash = block_file.validation().validation_hash;
+        state_diff.hash = block.state_root();
+        state_diff.parent_hash = parent_block.state_root();
+        Ok(DebankOutPut {
+            block_file,
+            header: debank_header,
+            state_diff: alloy_rlp::encode(state_diff).into(),
+            validation_hash,
+        })
+    }
 }
 
 #[async_trait]
 impl<Eth> TraceApiServer<RpcTxReq<Eth::NetworkTypes>> for TraceApi<Eth>
 where
-    Eth: TraceExt + 'static,
+    Eth: TraceExt + EthBlocks + LoadReceipt + 'static,
 {
     /// Executes the given call and returns a number of possible traces for it.
     ///
@@ -691,6 +874,11 @@ where
         let _permit = self.acquire_trace_permit().await;
         Ok(Self::trace_block_opcode_gas(self, block_id).await.map_err(Into::into)?)
     }
+
+    async fn trace_debank_block(&self, block_id: BlockId) -> RpcResult<DebankOutPut> {
+        let _permit = self.acquire_trace_permit().await;
+        Ok(Self::trace_debank_block(self, block_id).await.map_err(Into::into)?)
+    }
 }
 
 impl<Eth> std::fmt::Debug for TraceApi<Eth> {
@@ -711,6 +899,33 @@ struct TraceApiInner<Eth> {
     blocking_task_guard: BlockingTaskGuard,
     // eth config settings
     eth_config: EthConfig,
+}
+
+/// Response type for storage tracing that contains all accessed storage slots
+/// for a transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionStorageAccess {
+    /// Hash of the transaction
+    pub transaction_hash: B256,
+    /// Tracks storage slots and access counter.
+    pub storage_access: HashMap<Address, HashMap<B256, u64>>,
+    /// Number of unique storage loads
+    pub unique_loads: u64,
+    /// Number of warm storage loads
+    pub warm_loads: u64,
+}
+
+/// Response type for storage tracing that contains all accessed storage slots
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockStorageAccess {
+    /// The block hash
+    pub block_hash: BlockHash,
+    /// The block's number
+    pub block_number: u64,
+    /// All executed transactions in the block in the order they were executed
+    pub transactions: Vec<TransactionStorageAccess>,
 }
 
 /// Helper to construct a [`LocalizedTransactionTrace`] that describes a reward to the block
