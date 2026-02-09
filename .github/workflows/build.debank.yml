@@ -43,7 +43,7 @@ jobs:
             echo "REVISION=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
           fi
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-region: ${{ env.AWS_REGION }}
 
@@ -79,7 +79,7 @@ jobs:
           fi
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-region: ${{ env.AWS_REGION }}
 
